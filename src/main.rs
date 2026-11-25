@@ -6,7 +6,7 @@ use std::ffi::c_int;
 use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, NSObject, Sel};
 use objc2::{msg_send, sel, AnyThread, ClassType, MainThreadMarker};
 use objc2_app_kit::{
-    NSEventModifierFlags, NSImage, NSMenu, NSMenuItem, NSStatusItem, NSStatusBar, NSWindow,
+    NSEventModifierFlags, NSApplication, NSImage, NSMenu, NSMenuItem, NSStatusItem, NSStatusBar, NSWindow,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{NSString, NSObjectProtocol, NSUserNotification, NSUserNotificationCenter};
