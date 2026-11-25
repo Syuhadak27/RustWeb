@@ -40,8 +40,16 @@ jobs:
             curl -fsSL --retry 3 --retry-delay 5 \
               -o "$RUNNER_TEMP/cef.tar.bz2" \
               "https://cef-builds.spotifycdn.com/cef_binary_132.3.2+g4997b2f+chromium-132.0.6834.161_macosx64.tar.bz2"
+            echo "curl ok, bytes: $(wc -c < "$RUNNER_TEMP/cef.tar.bz2")"
+            echo "archive top level:"
+            tar -tjf "$RUNNER_TEMP/cef.tar.bz2" | head -n 5
             tar -xjf "$RUNNER_TEMP/cef.tar.bz2" -C "$CEF_PATH" --strip-components=1
-            test -d "$CEF_PATH/Chromium Embedded Framework.framework"
+            echo "extracted contents:"
+            ls -la "$CEF_PATH" | head -n 30
+            test -d "$CEF_PATH/Chromium Embedded Framework.framework" || {
+              echo "framework not found at expected path"
+              exit 1
+            }
           } 2>&1 | tee cef-download.log; then
             err="$(tail -n 30 cef-download.log | tr '\n' ' ' | cut -c1-1500)"
             echo "err=$err" >> "$GITHUB_OUTPUT"
