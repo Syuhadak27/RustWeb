@@ -25,6 +25,7 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSApplication",
     "NSButton",
     "NSControl",
+    "NSEvent",
     "NSImage",
     "NSMenu",
     "NSMenuItem",
@@ -32,6 +33,7 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSStatusBar",
     "NSStatusBarButton",
     "NSView",
+    "NSWindow",
 ] }
 objc2-foundation = { version = "0.3.2", features = [
     "NSString",

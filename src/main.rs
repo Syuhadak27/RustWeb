@@ -5,7 +5,10 @@ use cef::{args::Args, rc::*, sandbox_info::SandboxInfo, *};
 use std::ffi::c_int;
 use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, NSObject, Sel};
 use objc2::{msg_send, sel, AnyThread, ClassType, MainThreadMarker};
-use objc2_app_kit::{NSApplication, NSButton, NSControl, NSImage, NSStatusItem, NSStatusBar};
+use objc2_app_kit::{
+    NSEventModifierFlags, NSImage, NSMenu, NSMenuItem, NSStatusItem, NSStatusBar, NSWindow,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
+};
 use objc2_foundation::{NSString, NSObjectProtocol, NSUserNotification, NSUserNotificationCenter};
 use std::process::Command;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -132,6 +135,22 @@ extern "C-unwind" fn toggle_window(_this: &NSObject, _cmd: Sel) {
     }
 }
 
+extern "C-unwind" fn toggle_full_screen(
+    _this: &NSObject,
+    _cmd: Sel,
+    _sender: Option<&AnyObject>,
+) {
+    if let Some(state) = app_state() {
+        if let Ok(guard) = state.window.lock() {
+            if let Some(window) = guard.as_ref() {
+                if let Some(ns_window) = ns_window_from_cef(window) {
+                    ns_window.toggleFullScreen(None);
+                }
+            }
+        }
+    }
+}
+
 fn tray_target_class() -> &'static AnyClass {
     let mut builder = ClassBuilder::new(c"RustWebTrayTarget", NSObject::class())
         .expect("failed to create the menu bar target class");
@@ -140,8 +159,78 @@ fn tray_target_class() -> &'static AnyClass {
             sel!(toggleWindow),
             toggle_window as extern "C-unwind" fn(_, _),
         );
+        builder.add_method(
+            sel!(toggleFullScreen:),
+            toggle_full_screen as extern "C-unwind" fn(_, _, _),
+        );
     }
     builder.register()
+}
+
+/// Resolve the native NSWindow backing a CEF Views window handle.
+fn ns_window_from_cef(window: &impl ImplWindow) -> Option<&NSWindow> {
+    let handle = window.get_window_handle();
+    if handle == 0 {
+        return None;
+    }
+    Some(unsafe { &*(handle as usize as *const NSWindow) })
+}
+
+/// Make the native window capable of macOS Full Screen (green traffic light).
+fn configure_fullscreen(window: &impl ImplWindow) {
+    let Some(ns_window) = ns_window_from_cef(window) else { return };
+    let mut style = ns_window.styleMask();
+    style.insert(NSWindowStyleMask::Resizable);
+    ns_window.setStyleMask(style);
+    let mut behavior = ns_window.collectionBehavior();
+    behavior.insert(NSWindowCollectionBehavior::FullScreenPrimary);
+    ns_window.setCollectionBehavior(behavior);
+}
+
+/// Sync native fullscreen state with the state requested by the web page.
+fn ensure_native_fullscreen(fullscreen: bool) {
+    if let Some(state) = app_state() {
+        if let Ok(guard) = state.window.lock() {
+            if let Some(window) = guard.as_ref() {
+                if let Some(ns_window) = ns_window_from_cef(window) {
+                    let is_fullscreen = ns_window
+                        .styleMask()
+                        .contains(NSWindowStyleMask::FullScreen);
+                    if is_fullscreen != fullscreen {
+                        ns_window.toggleFullScreen(None);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Application menu: View → Enter Full Screen (⌃⌘F).
+fn install_app_menu() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let main_menu = NSMenu::new(mtm);
+    let view_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(),
+            &NSString::from_str("View"),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    let view_menu = NSMenu::new(mtm);
+    let fullscreen_item = unsafe {
+        view_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Enter Full Screen"),
+            Some(sel!(toggleFullScreen:)),
+            &NSString::from_str("f"),
+        )
+    };
+    fullscreen_item.setKeyEquivalentModifierMask(
+        NSEventModifierFlags::Control | NSEventModifierFlags::Command,
+    );
+    view_item.setSubmenu(Some(&view_menu));
+    main_menu.addItem(&view_item);
+    NSApplication::sharedApplication(mtm).setMainMenu(Some(&main_menu));
 }
 
 static mut STATUS_ITEM: Option<objc2::rc::Retained<NSStatusItem>> = None;
@@ -552,6 +641,55 @@ impl ImplRequestHandler for AppRequestHandler {
     }
 }
 
+// -- Display handler: web page fullscreen -> native macOS fullscreen ---------
+
+struct DemoDisplayHandler(*mut RcImpl<cef::sys::_cef_display_handler_t, Self>);
+
+impl DemoDisplayHandler {
+    fn new() -> DisplayHandler {
+        DisplayHandler::new(Self(std::ptr::null_mut()))
+    }
+}
+
+impl WrapDisplayHandler for DemoDisplayHandler {
+    fn wrap_rc(&mut self, object: *mut RcImpl<cef::sys::_cef_display_handler_t, Self>) {
+        self.0 = object;
+    }
+}
+
+impl Clone for DemoDisplayHandler {
+    fn clone(&self) -> Self {
+        unsafe {
+            let rc_impl = &mut *self.0;
+            rc_impl.interface.add_ref();
+        }
+        Self(self.0)
+    }
+}
+
+impl Rc for DemoDisplayHandler {
+    fn as_base(&self) -> &cef::sys::cef_base_ref_counted_t {
+        unsafe {
+            let base = &*self.0;
+            std::mem::transmute(&base.cef_object)
+        }
+    }
+}
+
+impl ImplDisplayHandler for DemoDisplayHandler {
+    fn get_raw(&self) -> *mut cef::sys::_cef_display_handler_t {
+        self.0 as *mut cef::sys::_cef_display_handler_t
+    }
+
+    fn on_fullscreen_mode_change(
+        &self,
+        _browser: Option<&mut impl ImplBrowser>,
+        fullscreen: c_int,
+    ) {
+        ensure_native_fullscreen(fullscreen != 0);
+    }
+}
+
 // -- Renderer bridge: Notification -> process message ------------------------
 
 struct NotifyV8Handler {
@@ -758,6 +896,10 @@ impl ImplClient for DemoClient {
         Some(AppRequestHandler::new())
     }
 
+    fn get_display_handler(&self) -> Option<DisplayHandler> {
+        Some(DemoDisplayHandler::new())
+    }
+
     fn on_process_message_received(
         &self,
         _browser: Option<&mut impl ImplBrowser>,
@@ -849,6 +991,7 @@ impl ImplWindowDelegate for DemoWindowDelegate {
                 width: WINDOW_WIDTH,
                 height: WINDOW_HEIGHT,
             }));
+            configure_fullscreen(window);
             let mut view = self.browser_view.clone();
             window.add_child_view(Some(&mut view));
             window.show();
@@ -904,6 +1047,7 @@ fn main() {
     let state = Arc::new(AppState::new());
     APP_STATE.store(Arc::into_raw(state.clone()) as *mut AppState, Ordering::SeqCst);
     install_tray();
+    install_app_menu();
 
     let args = Args::new();
     let cmd = args.as_cmd_line().unwrap();
