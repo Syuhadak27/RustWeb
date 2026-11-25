@@ -4,7 +4,7 @@
 use cef::{args::Args, rc::*, sandbox_info::SandboxInfo, *};
 use std::ffi::c_int;
 use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, NSObject, Sel};
-use objc2::{msg_send, sel, AnyThread, MainThreadMarker};
+use objc2::{msg_send, sel, AnyThread, ClassType, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSButton, NSControl, NSImage, NSStatusItem, NSStatusBar};
 use objc2_foundation::{NSString, NSObjectProtocol, NSUserNotification, NSUserNotificationCenter};
 use std::process::Command;
