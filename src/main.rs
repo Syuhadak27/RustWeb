@@ -3,7 +3,7 @@
 
 use cef::{args::Args, rc::*, sandbox_info::SandboxInfo, *};
 use objc2::runtime::NSObject;
-use objc2::{define_class, msg_send, sel, AnyThread, MainThreadMarker};
+use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSButton, NSControl, NSImage, NSStatusItem, NSStatusBar};
 use objc2_foundation::{NSString, NSObjectProtocol, NSUserNotification, NSUserNotificationCenter};
 use std::process::Command;
@@ -142,7 +142,7 @@ impl TrayTarget {
     }
 
     fn new() -> objc2::rc::Retained<Self> {
-        let this = Self::alloc();
+        let this = Self::alloc().set_ivars(());
         unsafe { msg_send![super(this), init] }
     }
 }
