@@ -11,8 +11,8 @@ permissions:
 
 jobs:
   build:
-    # Runner terbaru; target kompilasi tetap x86_64-apple-darwin / macOS 13 Ventura.
-    runs-on: macos-latest
+    # macOS terbaru dengan arsitektur Intel; target tetap macOS 13 Ventura x86_64.
+    runs-on: macos-26-intel
 
     steps:
       - name: Set CEF path
@@ -28,7 +28,7 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          key: x86_64-apple-darwin-v2
+          key: x86_64-apple-darwin-v3
 
       - name: Download CEF 132.3.2 (macOS x64)
         id: download
