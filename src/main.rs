@@ -1,14 +1,66 @@
-//! RustWeb — a minimal WhatsApp Web desktop client built with Rust + CEF.
+//! RustWeb — single-account WhatsApp Web desktop client.
+//! Pure Rust + Chromium Embedded Framework. No Tauri, no WKWebView, no updater.
 
 use cef::{args::Args, rc::*, sandbox_info::SandboxInfo, *};
+use objc2::runtime::NSObject;
+use objc2::{define_class, msg_send, sel, MainThreadMarker};
+use objc2_app_kit::{NSApplication, NSButton, NSControl, NSImage, NSStatusItem, NSStatusBar};
+use objc2_foundation::{NSString, NSObjectProtocol, NSUserNotification, NSUserNotificationCenter};
+use std::process::Command;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
 const WHATSAPP_URL: &str = "https://web.whatsapp.com";
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const WINDOW_WIDTH: i32 = 1180;
 const WINDOW_HEIGHT: i32 = 800;
+const NOTIFICATION_MESSAGE: &str = "RustWebNotification";
 
-/// Small file logger so a macOS launch failure can be diagnosed without a console.
+/// JS injected into the page: advertise granted notification permission and
+/// forward every `new Notification(...)` into the native Rust bridge.
+const NOTIFY_JS: &str = r#"
+(function () {
+  if (window.__rustwebNotifyBridge) return;
+  window.__rustwebNotifyBridge = true;
+  var DEDUP_MS = 3500;
+  var recent = Object.create(null);
+  var Bridge = function () {};
+  Bridge.permission = 'granted';
+  Bridge.requestPermission = function () { return Promise.resolve('granted'); };
+  var Original = window.Notification;
+  function Shim(title, options) {
+    if (!(this instanceof Shim)) return new Shim(title, options);
+    var t = String(title || 'WhatsApp');
+    var b = String((options && options.body) || '');
+    var key = t + ' ' + b;
+    var now = Date.now();
+    for (var k in recent) { if (now - recent[k] > DEDUP_MS) delete recent[k]; }
+    if (recent[key] && now - recent[key] <= DEDUP_MS) return;
+    recent[key] = now;
+    try { window.rustwebNotify(t, b); } catch (e) {}
+  }
+  Shim.prototype = Original ? Original.prototype : {};
+  Shim.permission = 'granted';
+  Shim.requestPermission = function () { return Promise.resolve('granted'); };
+  window.Notification = Shim;
+  try {
+    Object.defineProperty(window.Notification, 'permission', {
+      configurable: true, get: function () { return 'granted'; }
+    });
+  } catch (e) {}
+})();
+"#;
+
+/// Single, permanent session directory. No CLI profile switching.
+fn cache_dir() -> String {
+    let home = dirs::home_dir().expect("cannot locate the user home directory");
+    let path = home.join("Library/Application Support/RustWeb/profile");
+    std::fs::create_dir_all(&path).expect("cannot create the session directory");
+    path.to_str()
+        .expect("session path is not valid UTF-8")
+        .to_string()
+}
+
 fn log(message: &str) {
     if let Some(home) = dirs::home_dir() {
         let dir = home.join("Library/Application Support/RustWeb");
@@ -24,46 +76,156 @@ fn log(message: &str) {
     }
 }
 
-/// Parsed `--profile=<name>` argument and the resulting cache directory.
+fn is_whatsapp(url: &str) -> bool {
+    url.starts_with(WHATSAPP_URL) || url.starts_with("http://web.whatsapp.com")
+}
+
+/// Open anything outside WhatsApp Web in the default macOS browser.
+fn open_external(url: &str) {
+    if url.is_empty() || is_whatsapp(url) {
+        return;
+    }
+    let _ = Command::new("open").arg(url).spawn();
+}
+
+/// Shared window handle. Stored as a raw pointer so AppKit callbacks can
+/// restore the window from the menu bar.
+static APP_STATE: AtomicPtr<AppState> = AtomicPtr::new(std::ptr::null_mut());
+
 struct AppState {
-    profile_dir: String,
     window: Mutex<Option<Window>>,
 }
 
 impl AppState {
     fn new() -> Self {
-        let profile = std::env::args()
-            .skip(1)
-            .find_map(|arg| arg.strip_prefix("--profile=").map(str::to_string))
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "default".to_string());
-
-        let home = dirs::home_dir().expect("cannot locate the user home directory");
-        let profile_dir = home
-            .join("Library/Application Support/RustWeb/profiles")
-            .join(profile);
-        std::fs::create_dir_all(&profile_dir).expect("cannot create the profile directory");
-
         Self {
-            profile_dir: profile_dir
-                .to_str()
-                .expect("profile path is not valid UTF-8")
-                .to_string(),
             window: Mutex::new(None),
+        }
+    }
+
+    fn show_window(&self) {
+        if let Ok(guard) = self.window.lock() {
+            if let Some(window) = guard.as_ref() {
+                window.set_visible(1);
+            }
         }
     }
 }
 
+fn app_state() -> Option<&'static AppState> {
+    let ptr = APP_STATE.load(Ordering::SeqCst);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*ptr })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native macOS menu bar icon + Notification Center helpers
+// ---------------------------------------------------------------------------
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "RustWebTrayTarget"]
+    struct TrayTarget;
+);
+
+unsafe impl NSObjectProtocol for TrayTarget {}
+
+impl TrayTarget {
+    #[unsafe(method(toggleWindow))]
+    fn toggle_window(&self) {
+        if let Some(state) = app_state() {
+            state.show_window();
+        }
+    }
+
+    fn new() -> objc2::rc::Retained<Self> {
+        let this = Self::alloc();
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+static mut STATUS_ITEM: Option<objc2::rc::Retained<NSStatusItem>> = None;
+
+fn resource_path(name: &str) -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    exe.parent()?
+        .parent()?
+        .join("Resources")
+        .join(name)
+        .to_str()
+        .map(str::to_string)
+}
+
+fn tray_image(name: &str) -> Option<objc2::rc::Retained<NSImage>> {
+    let path = resource_path(name)?;
+    let image = unsafe {
+        NSImage::initWithContentsOfFile(NSImage::alloc(), &NSString::from_str(&path))
+    };
+    let image = image?;
+    image.setTemplate(true);
+    Some(image)
+}
+
+fn set_tray_unread(unread: bool) {
+    let name = if unread {
+        "tray-template-unread.png"
+    } else {
+        "tray-template.png"
+    };
+    let Some(image) = tray_image(name) else { return };
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    #[allow(static_mut_refs)]
+    unsafe {
+        if let Some(item) = STATUS_ITEM.as_ref() {
+            if let Some(button) = item.button(mtm) {
+                button.setImage(Some(&image));
+            }
+        }
+    }
+}
+
+fn install_tray() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let item = NSStatusBar::systemStatusBar().statusItemWithLength(24.0);
+    let target = TrayTarget::new();
+    if let Some(button) = item.button(mtm) {
+        if let Some(image) = tray_image("tray-template.png") {
+            button.setImage(Some(&image));
+        }
+        button.setTarget(Some(&target));
+        unsafe {
+            button.setAction(Some(sel!(toggleWindow)));
+        }
+    }
+    #[allow(static_mut_refs)]
+    unsafe {
+        STATUS_ITEM = Some(item);
+    }
+}
+
+fn native_notify(title: &str, body: &str) {
+    let notification = NSUserNotification::new();
+    notification.setTitle(Some(&NSString::from_str(title)));
+    notification.setInformativeText(Some(&NSString::from_str(body)));
+    NSUserNotificationCenter::defaultUserNotificationCenter().deliverNotification(&notification);
+    set_tray_unread(true);
+}
+
+// ---------------------------------------------------------------------------
+// CEF handlers
+// ---------------------------------------------------------------------------
+
 struct DemoApp {
     object: *mut RcImpl<cef::sys::_cef_app_t, Self>,
-    state: Arc<AppState>,
 }
 
 impl DemoApp {
-    fn new(state: Arc<AppState>) -> App {
+    fn new() -> App {
         App::new(Self {
             object: std::ptr::null_mut(),
-            state,
         })
     }
 }
@@ -81,10 +243,7 @@ impl Clone for DemoApp {
             rc_impl.interface.add_ref();
             self.object
         };
-        Self {
-            object,
-            state: self.state.clone(),
-        }
+        Self { object }
     }
 }
 
@@ -108,28 +267,33 @@ impl ImplApp for DemoApp {
         command_line: Option<&mut impl ImplCommandLine>,
     ) {
         if let Some(command_line) = command_line {
-            // Give WebRTC video/voice calls access to the camera and microphone
-            // without a blocked permission prompt.
+            // WebRTC media access without a blocking permission prompt.
             command_line.append_switch(Some(&"use-fake-ui-for-media-stream".into()));
             command_line.append_switch(Some(&"enable-media-stream".into()));
+            // Keep WhatsApp's WebSocket alive while the window is hidden.
+            command_line.append_switch(Some(&"disable-background-timer-throttling".into()));
+            command_line.append_switch(Some(&"disable-backgrounding-occluded-windows".into()));
+            command_line.append_switch(Some(&"disable-renderer-backgrounding".into()));
         }
     }
 
     fn get_browser_process_handler(&self) -> Option<BrowserProcessHandler> {
-        Some(DemoBrowserProcessHandler::new(self.state.clone()))
+        Some(DemoBrowserProcessHandler::new())
+    }
+
+    fn get_render_process_handler(&self) -> Option<RenderProcessHandler> {
+        Some(DemoRenderProcessHandler::new())
     }
 }
 
 struct DemoBrowserProcessHandler {
     object: *mut RcImpl<cef::sys::cef_browser_process_handler_t, Self>,
-    state: Arc<AppState>,
 }
 
 impl DemoBrowserProcessHandler {
-    fn new(state: Arc<AppState>) -> BrowserProcessHandler {
+    fn new() -> BrowserProcessHandler {
         BrowserProcessHandler::new(Self {
             object: std::ptr::null_mut(),
-            state,
         })
     }
 }
@@ -159,10 +323,7 @@ impl Clone for DemoBrowserProcessHandler {
             rc_impl.interface.add_ref();
             rc_impl
         };
-        Self {
-            object,
-            state: self.state.clone(),
-        }
+        Self { object }
     }
 }
 
@@ -171,14 +332,13 @@ impl ImplBrowserProcessHandler for DemoBrowserProcessHandler {
         self.object.cast()
     }
 
-    /// CEF objects must only be created after the context is initialized.
     fn on_context_initialized(&self) {
         log("CEF context initialized");
         let mut client = DemoClient::new();
         let url = CefString::from(&CefStringUtf8::from(WHATSAPP_URL));
 
         let mut context_settings = RequestContextSettings::default();
-        context_settings.cache_path = self.state.profile_dir.as_str().into();
+        context_settings.cache_path = cache_dir().as_str().into();
         context_settings.persist_session_cookies = 1;
         let mut context = request_context_create_context(
             Some(&context_settings),
@@ -197,7 +357,11 @@ impl ImplBrowserProcessHandler for DemoBrowserProcessHandler {
         .expect("failed to create the browser view");
 
         let mut delegate = DemoWindowDelegate::new(browser_view);
-        if let Ok(mut window) = self.state.window.lock() {
+        if let Ok(mut window) = app_state()
+            .expect("application state missing")
+            .window
+            .lock()
+        {
             *window = Some(
                 window_create_top_level(Some(&mut delegate)).expect("failed to create the window"),
             );
@@ -205,6 +369,347 @@ impl ImplBrowserProcessHandler for DemoBrowserProcessHandler {
         }
     }
 }
+
+// -- Permission handler: grant camera/microphone immediately -----------------
+
+struct WebPermissionHandler(*mut RcImpl<cef::sys::_cef_permission_handler_t, Self>);
+
+impl WebPermissionHandler {
+    fn new() -> PermissionHandler {
+        PermissionHandler::new(Self(std::ptr::null_mut()))
+    }
+}
+
+impl WrapPermissionHandler for WebPermissionHandler {
+    fn wrap_rc(
+        &mut self,
+        object: *mut RcImpl<cef::sys::_cef_permission_handler_t, Self>,
+    ) {
+        self.0 = object;
+    }
+}
+
+impl Clone for WebPermissionHandler {
+    fn clone(&self) -> Self {
+        unsafe {
+            let rc_impl = &mut *self.0;
+            rc_impl.interface.add_ref();
+        }
+        Self(self.0)
+    }
+}
+
+impl Rc for WebPermissionHandler {
+    fn as_base(&self) -> &cef::sys::cef_base_ref_counted_t {
+        unsafe {
+            let base = &*self.0;
+            std::mem::transmute(&base.cef_object)
+        }
+    }
+}
+
+impl ImplPermissionHandler for WebPermissionHandler {
+    fn get_raw(&self) -> *mut cef::sys::_cef_permission_handler_t {
+        self.0 as *mut cef::sys::_cef_permission_handler_t
+    }
+
+    fn on_request_media_access_permission(
+        &self,
+        _browser: Option<&mut impl ImplBrowser>,
+        _frame: Option<&mut impl ImplFrame>,
+        _requesting_origin: Option<&CefStringUtf16>,
+        requested_permissions: u32,
+        callback: Option<&mut impl ImplMediaAccessCallback>,
+    ) -> c_int {
+        if let Some(callback) = callback {
+            callback.cont(requested_permissions);
+        }
+        1
+    }
+}
+
+// -- Life span handler: external links go to the default browser -------------
+
+struct AppLifeSpanHandler(*mut RcImpl<cef::sys::_cef_life_span_handler_t, Self>);
+
+impl AppLifeSpanHandler {
+    fn new() -> LifeSpanHandler {
+        LifeSpanHandler::new(Self(std::ptr::null_mut()))
+    }
+}
+
+impl WrapLifeSpanHandler for AppLifeSpanHandler {
+    fn wrap_rc(&mut self, object: *mut RcImpl<cef::sys::_cef_life_span_handler_t, Self>) {
+        self.0 = object;
+    }
+}
+
+impl Clone for AppLifeSpanHandler {
+    fn clone(&self) -> Self {
+        unsafe {
+            let rc_impl = &mut *self.0;
+            rc_impl.interface.add_ref();
+        }
+        Self(self.0)
+    }
+}
+
+impl Rc for AppLifeSpanHandler {
+    fn as_base(&self) -> &cef::sys::cef_base_ref_counted_t {
+        unsafe {
+            let base = &*self.0;
+            std::mem::transmute(&base.cef_object)
+        }
+    }
+}
+
+impl ImplLifeSpanHandler for AppLifeSpanHandler {
+    fn get_raw(&self) -> *mut cef::sys::_cef_life_span_handler_t {
+        self.0 as *mut cef::sys::_cef_life_span_handler_t
+    }
+
+    fn on_before_popup(
+        &self,
+        _browser: Option<&mut impl ImplBrowser>,
+        _frame: Option<&mut impl ImplFrame>,
+        _popup_id: c_int,
+        target_url: Option<&CefStringUtf16>,
+        _target_frame_name: Option<&CefStringUtf16>,
+        _target_disposition: WindowOpenDisposition,
+        _user_gesture: c_int,
+        _popup_features: Option<&PopupFeatures>,
+        _window_info: Option<&mut WindowInfo>,
+        _client: Option<&mut impl ImplClient>,
+        _settings: Option<&mut BrowserSettings>,
+        _extra_info: Option<&mut impl ImplDictionaryValue>,
+        _no_javascript_access: Option<&mut c_int>,
+    ) -> c_int {
+        if let Some(url) = target_url {
+            let url = CefStringUtf8::from(url).to_string();
+            if !is_whatsapp(&url) {
+                open_external(&url);
+                return 1;
+            }
+        }
+        0
+    }
+}
+
+// -- Request handler: cancel navigation to external URLs ---------------------
+
+struct AppRequestHandler(*mut RcImpl<cef::sys::_cef_request_handler_t, Self>);
+
+impl AppRequestHandler {
+    fn new() -> RequestHandler {
+        RequestHandler::new(Self(std::ptr::null_mut()))
+    }
+}
+
+impl WrapRequestHandler for AppRequestHandler {
+    fn wrap_rc(&mut self, object: *mut RcImpl<cef::sys::_cef_request_handler_t, Self>) {
+        self.0 = object;
+    }
+}
+
+impl Clone for AppRequestHandler {
+    fn clone(&self) -> Self {
+        unsafe {
+            let rc_impl = &mut *self.0;
+            rc_impl.interface.add_ref();
+        }
+        Self(self.0)
+    }
+}
+
+impl Rc for AppRequestHandler {
+    fn as_base(&self) -> &cef::sys::cef_base_ref_counted_t {
+        unsafe {
+            let base = &*self.0;
+            std::mem::transmute(&base.cef_object)
+        }
+    }
+}
+
+impl ImplRequestHandler for AppRequestHandler {
+    fn get_raw(&self) -> *mut cef::sys::_cef_request_handler_t {
+        self.0 as *mut cef::sys::_cef_request_handler_t
+    }
+
+    fn on_before_browse(
+        &self,
+        _browser: Option<&mut impl ImplBrowser>,
+        _frame: Option<&mut impl ImplFrame>,
+        request: Option<&mut impl ImplRequest>,
+        _user_gesture: c_int,
+        _is_redirect: c_int,
+    ) -> c_int {
+        if let Some(request) = request {
+            if let Some(url) = request.get_url() {
+                let url = CefStringUtf8::from(&url).to_string();
+                if !is_whatsapp(&url) {
+                    open_external(&url);
+                    return 1;
+                }
+            }
+        }
+        0
+    }
+}
+
+// -- Renderer bridge: Notification -> process message ------------------------
+
+struct NotifyV8Handler {
+    object: *mut RcImpl<cef::sys::_cef_v8handler_t, Self>,
+    frame: Option<Frame>,
+}
+
+impl NotifyV8Handler {
+    fn new(frame: Option<Frame>) -> V8handler {
+        V8handler::new(Self {
+            object: std::ptr::null_mut(),
+            frame,
+        })
+    }
+}
+
+impl WrapV8handler for NotifyV8Handler {
+    fn wrap_rc(&mut self, object: *mut RcImpl<cef::sys::_cef_v8handler_t, Self>) {
+        self.object = object;
+    }
+}
+
+impl Clone for NotifyV8Handler {
+    fn clone(&self) -> Self {
+        unsafe {
+            let rc_impl = &mut *self.object;
+            rc_impl.interface.add_ref();
+        }
+        Self {
+            object: self.object,
+            frame: self.frame.clone(),
+        }
+    }
+}
+
+impl Rc for NotifyV8Handler {
+    fn as_base(&self) -> &cef::sys::cef_base_ref_counted_t {
+        unsafe {
+            let base = &*self.object;
+            std::mem::transmute(&base.cef_object)
+        }
+    }
+}
+
+impl ImplV8handler for NotifyV8Handler {
+    fn get_raw(&self) -> *mut cef::sys::_cef_v8handler_t {
+        self.object as *mut cef::sys::_cef_v8handler_t
+    }
+
+    fn execute(
+        &self,
+        _name: Option<&CefStringUtf16>,
+        _object: Option<&mut impl ImplV8value>,
+        arguments: Option<&[Option<impl ImplV8value>]>,
+        _retval: Option<&mut impl ImplV8value>,
+        _exception: Option<&mut CefStringUtf16>,
+    ) -> c_int {
+        let arguments = arguments.unwrap_or(&[]);
+        let title = arguments
+            .first()
+            .and_then(|value| value.as_ref())
+            .and_then(|value| value.get_string_value())
+            .map(|value| CefStringUtf8::from(&value).to_string())
+            .unwrap_or_else(|| "WhatsApp".to_string());
+        let body = arguments
+            .get(1)
+            .and_then(|value| value.as_ref())
+            .and_then(|value| value.get_string_value())
+            .map(|value| CefStringUtf8::from(&value).to_string())
+            .unwrap_or_default();
+
+        if let Some(frame) = &self.frame {
+            if let Some(message) = process_message_create(Some(&NOTIFICATION_MESSAGE.into())) {
+                if let Some(args) = message.get_argument_list() {
+                    args.set_string(0, Some(&title.as_str().into()));
+                    args.set_string(1, Some(&body.as_str().into()));
+                }
+                frame.send_process_message(ProcessId::default(), Some(&mut message));
+            }
+        }
+        1
+    }
+}
+
+struct DemoRenderProcessHandler {
+    object: *mut RcImpl<cef::sys::_cef_render_process_handler_t, Self>,
+}
+
+impl DemoRenderProcessHandler {
+    fn new() -> RenderProcessHandler {
+        RenderProcessHandler::new(Self {
+            object: std::ptr::null_mut(),
+        })
+    }
+}
+
+impl WrapRenderProcessHandler for DemoRenderProcessHandler {
+    fn wrap_rc(
+        &mut self,
+        object: *mut RcImpl<cef::sys::_cef_render_process_handler_t, Self>,
+    ) {
+        self.object = object;
+    }
+}
+
+impl Clone for DemoRenderProcessHandler {
+    fn clone(&self) -> Self {
+        unsafe {
+            let rc_impl = &mut *self.object;
+            rc_impl.interface.add_ref();
+        }
+        Self { object: self.object }
+    }
+}
+
+impl Rc for DemoRenderProcessHandler {
+    fn as_base(&self) -> &cef::sys::cef_base_ref_counted_t {
+        unsafe {
+            let base = &*self.object;
+            std::mem::transmute(&base.cef_object)
+        }
+    }
+}
+
+impl ImplRenderProcessHandler for DemoRenderProcessHandler {
+    fn get_raw(&self) -> *mut cef::sys::_cef_render_process_handler_t {
+        self.object as *mut cef::sys::_cef_render_process_handler_t
+    }
+
+    fn on_context_created(
+        &self,
+        _browser: Option<&mut impl ImplBrowser>,
+        frame: Option<&mut impl ImplFrame>,
+        context: Option<&mut impl ImplV8context>,
+    ) {
+        let (Some(frame), Some(context)) = (frame, context) else { return };
+        if frame.is_main() != 1 {
+            return;
+        }
+        let Some(global) = context.get_global() else { return };
+        let mut handler = NotifyV8Handler::new(Some(frame.clone()));
+        let name = CefStringUtf16::from("rustwebNotify");
+        if let Some(mut function) = v8value_create_function(Some(&name), Some(&mut handler)) {
+            global.set_value_bykey(
+                Some(&name),
+                Some(&mut function),
+                V8Propertyattribute::default(),
+            );
+        }
+        frame.execute_java_script(Some(&CefStringUtf16::from(NOTIFY_JS)), None, 0);
+    }
+}
+
+// -- Client: handlers + native notification delivery -------------------------
 
 struct DemoClient(*mut RcImpl<cef::sys::_cef_client_t, Self>);
 
@@ -243,7 +748,51 @@ impl ImplClient for DemoClient {
     fn get_raw(&self) -> *mut cef::sys::_cef_client_t {
         self.0 as *mut cef::sys::_cef_client_t
     }
+
+    fn get_permission_handler(&self) -> Option<PermissionHandler> {
+        Some(WebPermissionHandler::new())
+    }
+
+    fn get_life_span_handler(&self) -> Option<LifeSpanHandler> {
+        Some(AppLifeSpanHandler::new())
+    }
+
+    fn get_request_handler(&self) -> Option<RequestHandler> {
+        Some(AppRequestHandler::new())
+    }
+
+    fn on_process_message_received(
+        &self,
+        _browser: Option<&mut impl ImplBrowser>,
+        _frame: Option<&mut impl ImplFrame>,
+        _source_process: ProcessId,
+        message: Option<&mut impl ImplProcessMessage>,
+    ) -> c_int {
+        let Some(message) = message else { return 0 };
+        let name = message
+            .get_name()
+            .map(|name| CefStringUtf8::from(&name).to_string())
+            .unwrap_or_default();
+        if name != NOTIFICATION_MESSAGE {
+            return 0;
+        }
+        let args = message.get_argument_list();
+        let title = args
+            .as_ref()
+            .and_then(|args| args.get_string(0))
+            .map(|value| CefStringUtf8::from(&value).to_string())
+            .unwrap_or_else(|| "WhatsApp".to_string());
+        let body = args
+            .as_ref()
+            .and_then(|args| args.get_string(1))
+            .map(|value| CefStringUtf8::from(&value).to_string())
+            .unwrap_or_default();
+        native_notify(&title, &body);
+        1
+    }
 }
+
+// -- Window delegate: hide on close, restore from menu bar -------------------
 
 struct DemoWindowDelegate {
     base: *mut RcImpl<cef::sys::_cef_window_delegate_t, Self>,
@@ -314,26 +863,30 @@ impl ImplWindowDelegate for DemoWindowDelegate {
         quit_message_loop();
     }
 
+    /// Close button hides the window to the menu bar instead of quitting.
+    fn can_close(&self, window: Option<&mut impl ImplWindow>) -> c_int {
+        if let Some(window) = window {
+            window.set_visible(0);
+        }
+        0
+    }
+
     fn with_standard_window_buttons(
         &self,
         _window: Option<&mut impl ImplWindow>,
-    ) -> ::std::os::raw::c_int {
+    ) -> c_int {
         1
     }
 
-    fn can_resize(&self, _window: Option<&mut impl ImplWindow>) -> ::std::os::raw::c_int {
+    fn can_resize(&self, _window: Option<&mut impl ImplWindow>) -> c_int {
         1
     }
 
-    fn can_maximize(&self, _window: Option<&mut impl ImplWindow>) -> ::std::os::raw::c_int {
+    fn can_maximize(&self, _window: Option<&mut impl ImplWindow>) -> c_int {
         1
     }
 
-    fn can_minimize(&self, _window: Option<&mut impl ImplWindow>) -> ::std::os::raw::c_int {
-        1
-    }
-
-    fn can_close(&self, _window: Option<&mut impl ImplWindow>) -> ::std::os::raw::c_int {
+    fn can_minimize(&self, _window: Option<&mut impl ImplWindow>) -> c_int {
         1
     }
 }
@@ -351,14 +904,16 @@ fn main() {
         loader
     };
 
+    let state = Arc::new(AppState::new());
+    APP_STATE.store(Arc::into_raw(state.clone()) as *mut AppState, Ordering::SeqCst);
+    install_tray();
+
     let args = Args::new();
     let cmd = args.as_cmd_line().unwrap();
     let sandbox = SandboxInfo::new();
     let is_browser_process = cmd.has_switch(Some(&"type".into())) != 1;
 
-    let state = Arc::new(AppState::new());
-    let mut app = DemoApp::new(state.clone());
-
+    let mut app = DemoApp::new();
     let ret = execute_process(
         Some(args.as_main_args()),
         Some(&mut app),
@@ -367,15 +922,13 @@ fn main() {
     log(&format!("execute_process returned {ret}"));
 
     if !is_browser_process {
-        // Renderer / GPU / utility helper processes exit here.
         return;
     }
     assert_eq!(ret, -1, "cannot execute browser process");
 
     let mut settings = Settings::default();
-    // Ad-hoc signed bundles have no sandbox profile; let CEF run unsandboxed.
     settings.no_sandbox = 1;
-    settings.root_cache_path = state.profile_dir.as_str().into();
+    settings.root_cache_path = cache_dir().as_str().into();
     settings.persist_session_cookies = 1;
     settings.user_agent = USER_AGENT.into();
 
@@ -393,10 +946,5 @@ fn main() {
 
     run_message_loop();
     log("message loop exited");
-
-    let window = state.window.lock().expect("failed to lock the window");
-    let window = window.as_ref().expect("window was never created");
-    assert!(window.has_one_ref());
-
     shutdown();
 }

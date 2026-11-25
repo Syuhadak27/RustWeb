@@ -1,6 +1,6 @@
 [package]
 name = "rustweb"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 autobins = false
 
@@ -13,10 +13,30 @@ name = "rustweb_helper"
 path = "src/helper.rs"
 
 [dependencies]
-# CEF 132 is the closest published release to the requested CEF 131.
-# The CEF binaries are downloaded automatically by cef-dll-sys at build time.
+# CEF 132 is the closest published release to CEF 131.
+# CEF binaries are downloaded by the macOS CI workflow and provided via CEF_PATH.
 cef = "132.3.2"
 dirs = "5.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Native menu bar icon and Notification Center bridge (no Tauri / no WKWebView).
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", features = [
+    "NSApplication",
+    "NSButton",
+    "NSControl",
+    "NSImage",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSView",
+] }
+objc2-foundation = { version = "0.3.2", features = [
+    "NSString",
+    "NSUserNotification",
+] }
 
 [profile.release]
 opt-level = "s"

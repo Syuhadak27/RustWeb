@@ -1,4 +1,4 @@
-name: Build & Release macOS Universal
+name: Build & Release macOS (Intel + Apple Silicon + Universal)
 
 on:
   push:
@@ -125,7 +125,7 @@ jobs:
           if-no-files-found: error
 
   package:
-    name: package universal app
+    name: package macOS bundles
     needs: build
     runs-on: macos-26-intel
 
@@ -145,16 +145,12 @@ jobs:
           X64="artifacts/build-x86_64"
           ARM="artifacts/build-arm64"
           DEST="dist/universal"
-
           mkdir -p "$DEST"
           lipo -create "$X64/bin/rustweb" "$ARM/bin/rustweb" -output "$DEST/rustweb"
           lipo -create "$X64/bin/rustweb_helper" "$ARM/bin/rustweb_helper" -output "$DEST/rustweb_helper"
-
           FW="Chromium Embedded Framework.framework"
           rm -rf "$DEST/$FW"
           cp -R "$ARM/cef/$FW" "$DEST/$FW"
-
-          # Merge every Mach-O file inside the framework (binary + dylibs).
           while IFS= read -r -d '' file; do
             rel="${file#$ARM/cef/$FW/}"
             other="$X64/cef/$FW/$rel"
@@ -163,35 +159,33 @@ jobs:
             fi
           done < <(find "$DEST/$FW" -type f -print0)
 
-          echo "Universal framework:"
-          find "$DEST/$FW" -type f -name 'Chromium Embedded Framework' -o -name '*.dylib' | head -n 20
-
-      - name: Assemble RustWeb.app
+      - name: Assemble three app bundles
         run: |
           set -euo pipefail
-          APP="dist/RustWeb.app"
-          UNI="dist/universal"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
 
-          cp "$UNI/rustweb" "$APP/Contents/MacOS/rustweb"
-          cp Info.plist "$APP/Contents/Info.plist"
-          cp -R "$UNI/Chromium Embedded Framework.framework" "$APP/Contents/Frameworks/"
+          assemble() {
+            local variant="$1" bin="$2" helper="$3" framework="$4"
+            local app="dist/$variant/RustWeb.app"
+            mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks" "$app/Contents/Resources"
+            cp "$bin" "$app/Contents/MacOS/rustweb"
+            cp Info.plist "$app/Contents/Info.plist"
+            cp -R "$framework" "$app/Contents/Frameworks/"
+            cp assets/tray-template.png assets/tray-template-unread.png "$app/Contents/Resources/"
 
-          helpers=(
-            "rustweb Helper (GPU)|gpu"
-            "rustweb Helper (Renderer)|renderer"
-            "rustweb Helper (Plugin)|plugin"
-            "rustweb Helper (Alerts)|alerts"
-            "rustweb Helper|main"
-          )
-          for entry in "${helpers[@]}"; do
-            name="${entry%%|*}"
-            suffix="${entry##*|}"
-            helper="$APP/Contents/Frameworks/$name.app"
-            mkdir -p "$helper/Contents/MacOS"
-            cp "$UNI/rustweb_helper" "$helper/Contents/MacOS/$name"
-            chmod +x "$helper/Contents/MacOS/$name"
-            cat > "$helper/Contents/Info.plist" <<EOF
+            local helpers=(
+              "rustweb Helper (GPU)|gpu"
+              "rustweb Helper (Renderer)|renderer"
+              "rustweb Helper (Plugin)|plugin"
+              "rustweb Helper (Alerts)|alerts"
+              "rustweb Helper|main"
+            )
+            for entry in "${helpers[@]}"; do
+              local name="${entry%%|*}" suffix="${entry##*|}"
+              local helper_app="$app/Contents/Frameworks/$name.app"
+              mkdir -p "$helper_app/Contents/MacOS"
+              cp "$helper" "$helper_app/Contents/MacOS/$name"
+              chmod +x "$helper_app/Contents/MacOS/$name"
+              cat > "$helper_app/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -209,9 +203,9 @@ jobs:
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleVersion</key>
-              <string>0.2.0</string>
+              <string>0.3.0</string>
               <key>CFBundleShortVersionString</key>
-              <string>0.2.0</string>
+              <string>0.3.0</string>
               <key>LSMinimumSystemVersion</key>
               <string>13.0</string>
               <key>LSUIElement</key>
@@ -223,42 +217,64 @@ jobs:
           </dict>
           </plist>
           EOF
-          done
+            done
+          }
 
-      - name: Create icon.icns from icon.png
+          FW="Chromium Embedded Framework.framework"
+          assemble Intel \
+            "artifacts/build-x86_64/bin/rustweb" \
+            "artifacts/build-x86_64/bin/rustweb_helper" \
+            "artifacts/build-x86_64/cef/$FW"
+          assemble AppleSilicon \
+            "artifacts/build-arm64/bin/rustweb" \
+            "artifacts/build-arm64/bin/rustweb_helper" \
+            "artifacts/build-arm64/cef/$FW"
+          assemble Universal \
+            "dist/universal/rustweb" \
+            "dist/universal/rustweb_helper" \
+            "dist/universal/$FW"
+
+      - name: Create icons, sign, and package DMGs
         run: |
           set -euo pipefail
-          mkdir -p icon.iconset dist/RustWeb.app/Contents/Resources
+          mkdir -p icon.iconset
           for size in 16 32 128 256 512; do
             double=$((size * 2))
             sips -z "$size" "$size" icon.png --out "icon.iconset/icon_${size}x${size}.png" >/dev/null
             sips -z "$double" "$double" icon.png --out "icon.iconset/icon_${size}x${size}@2x.png" >/dev/null
           done
-          iconutil -c icns icon.iconset -o dist/RustWeb.app/Contents/Resources/icon.icns
+          for variant in Intel AppleSilicon Universal; do
+            app="dist/$variant/RustWeb.app"
+            iconutil -c icns icon.iconset -o "$app/Contents/Resources/icon.icns"
+            codesign --force --deep --sign - --entitlements entitlements.plist "$app"
+          done
           rm -rf icon.iconset
 
-      - name: Ad-hoc sign the app bundle
-        run: codesign --force --deep --sign - --entitlements entitlements.plist dist/RustWeb.app
+          hdiutil create -volname RustWeb -srcfolder dist/Intel/RustWeb.app \
+            -ov -format UDZO dist/RustWeb-macOS-Intel.dmg
+          hdiutil create -volname RustWeb -srcfolder dist/AppleSilicon/RustWeb.app \
+            -ov -format UDZO dist/RustWeb-macOS-AppleSilicon.dmg
+          hdiutil create -volname RustWeb -srcfolder dist/Universal/RustWeb.app \
+            -ov -format UDZO dist/RustWeb-macOS-Universal.dmg
 
-      - name: Create disk image
-        run: |
-          hdiutil create -volname RustWeb \
-            -srcfolder dist/RustWeb.app \
-            -ov -format UDZO \
-            dist/RustWeb-macOS-Universal.dmg
-
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: RustWeb-macOS-Universal
-          path: dist/RustWeb-macOS-Universal.dmg
+          name: RustWeb-macOS
+          path: |
+            dist/RustWeb-macOS-Intel.dmg
+            dist/RustWeb-macOS-AppleSilicon.dmg
+            dist/RustWeb-macOS-Universal.dmg
           if-no-files-found: error
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          name: RustWeb ${{ github.ref_name }} (macOS Universal)
-          files: dist/RustWeb-macOS-Universal.dmg
+          name: RustWeb ${{ github.ref_name }} (macOS)
+          files: |
+            dist/RustWeb-macOS-Intel.dmg
+            dist/RustWeb-macOS-AppleSilicon.dmg
+            dist/RustWeb-macOS-Universal.dmg
           generate_release_notes: true
           fail_on_unmatched_files: true
