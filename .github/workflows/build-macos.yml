@@ -11,7 +11,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14
+    # Runner terbaru; target kompilasi tetap x86_64-apple-darwin / macOS 13 Ventura.
+    runs-on: macos-latest
 
     steps:
       - name: Checkout repository
