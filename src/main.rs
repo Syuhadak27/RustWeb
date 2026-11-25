@@ -3,7 +3,7 @@
 
 use cef::{args::Args, rc::*, sandbox_info::SandboxInfo, *};
 use objc2::runtime::NSObject;
-use objc2::{define_class, msg_send, sel, MainThreadMarker};
+use objc2::{define_class, msg_send, sel, AnyThread, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSButton, NSControl, NSImage, NSStatusItem, NSStatusBar};
 use objc2_foundation::{NSString, NSObjectProtocol, NSUserNotification, NSUserNotificationCenter};
 use std::process::Command;
