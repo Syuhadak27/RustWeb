@@ -206,6 +206,7 @@ fn install_tray() {
     }
 }
 
+#[allow(deprecated)]
 fn native_notify(title: &str, body: &str) {
     let notification = NSUserNotification::new();
     notification.setTitle(Some(&NSString::from_str(title)));
@@ -691,7 +692,8 @@ impl ImplRenderProcessHandler for DemoRenderProcessHandler {
         frame: Option<&mut impl ImplFrame>,
         context: Option<&mut impl ImplV8context>,
     ) {
-        let (Some(frame), Some(context)) = (frame, context) else { return };
+        let (Some(_frame), Some(context)) = (frame, context) else { return };
+        let Some(frame) = context.get_frame() else { return };
         if frame.is_main() != 1 {
             return;
         }
