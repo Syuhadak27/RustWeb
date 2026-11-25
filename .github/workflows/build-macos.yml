@@ -13,6 +13,9 @@ jobs:
   build:
     # Runner terbaru; target kompilasi tetap x86_64-apple-darwin / macOS 13 Ventura.
     runs-on: macos-latest
+    env:
+      # Bypass download-cef's 10 MB index limit by providing CEF directly.
+      CEF_PATH: ${{ runner.temp }}/cef
 
     steps:
       - name: Checkout repository
@@ -25,6 +28,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: x86_64-apple-darwin
+
+      - name: Download CEF 132.3.2 (macOS x64)
+        run: |
+          set -euo pipefail
+          mkdir -p "$CEF_PATH"
+          curl -fL --retry 3 --retry-delay 5 \
+            -o "$RUNNER_TEMP/cef.tar.bz2" \
+            "https://cef-builds.spotifycdn.com/cef_binary_132.3.2+g4997b2f+chromium-132.0.6834.161_macosx64.tar.bz2"
+          tar -xjf "$RUNNER_TEMP/cef.tar.bz2" -C "$CEF_PATH" --strip-components=1
+          test -d "$CEF_PATH/Chromium Embedded Framework.framework"
 
       - name: Build RustWeb (x86_64-apple-darwin)
         id: build
@@ -60,8 +73,11 @@ jobs:
           cp "$TARGET/rustweb" "$APP/Contents/MacOS/rustweb"
           cp Info.plist "$APP/Contents/Info.plist"
 
-          # Locate the CEF distribution downloaded by cef-dll-sys during the build.
-          CEF_DIR="$(find target/x86_64-apple-darwin/release/build -type d -name cef_macos_x86_64 -print -quit)"
+          # Use the CEF distribution prepared before the build.
+          CEF_DIR="$CEF_PATH"
+          if [ ! -d "$CEF_DIR/Chromium Embedded Framework.framework" ]; then
+            CEF_DIR="$(find target/x86_64-apple-darwin/release/build -type d -name cef_macos_x86_64 -print -quit)"
+          fi
           if [ -z "$CEF_DIR" ]; then
             echo "Could not locate the downloaded CEF directory" >&2
             exit 1
