@@ -209,14 +209,8 @@ fn ensure_native_fullscreen(fullscreen: bool) {
 fn install_app_menu() {
     let Some(mtm) = MainThreadMarker::new() else { return };
     let main_menu = NSMenu::new(mtm);
-    let view_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("View"),
-            None,
-            &NSString::from_str(""),
-        )
-    };
+    let view_item = NSMenuItem::new(mtm);
+    view_item.setTitle(&NSString::from_str("View"));
     let view_menu = NSMenu::new(mtm);
     let fullscreen_item = unsafe {
         view_menu.addItemWithTitle_action_keyEquivalent(
