@@ -51,6 +51,13 @@ jobs:
               cp -R "$SRC/$item" "$CEF_PATH/"
             done
             cp -R "$SRC/CREDITS.html" "$CEF_PATH/" 2>/dev/null || true
+            # rustc looks for libcef_sandbox.a; CEF ships it as cef_sandbox.a.
+            find "$SRC" -name 'cef_sandbox.a' -print
+            if [ -f "$SRC/Release/cef_sandbox.a" ]; then
+              cp "$SRC/Release/cef_sandbox.a" "$CEF_PATH/libcef_sandbox.a"
+            elif [ -f "$SRC/cef_sandbox.a" ]; then
+              cp "$SRC/cef_sandbox.a" "$CEF_PATH/libcef_sandbox.a"
+            fi
             echo "CEF dir contents:"
             ls -la "$CEF_PATH" | head -n 30
             test -d "$CEF_PATH/Chromium Embedded Framework.framework" || {
