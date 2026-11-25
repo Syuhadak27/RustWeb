@@ -8,6 +8,22 @@ const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_7) AppleWe
 const WINDOW_WIDTH: i32 = 1180;
 const WINDOW_HEIGHT: i32 = 800;
 
+/// Small file logger so a macOS launch failure can be diagnosed without a console.
+fn log(message: &str) {
+    if let Some(home) = dirs::home_dir() {
+        let dir = home.join("Library/Application Support/RustWeb");
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("launch.log"))
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{}", message);
+        }
+    }
+}
+
 /// Parsed `--profile=<name>` argument and the resulting cache directory.
 struct AppState {
     profile_dir: String,
@@ -157,6 +173,7 @@ impl ImplBrowserProcessHandler for DemoBrowserProcessHandler {
 
     /// CEF objects must only be created after the context is initialized.
     fn on_context_initialized(&self) {
+        log("CEF context initialized");
         let mut client = DemoClient::new();
         let url = CefString::from(&CefStringUtf8::from(WHATSAPP_URL));
 
@@ -184,6 +201,7 @@ impl ImplBrowserProcessHandler for DemoBrowserProcessHandler {
             *window = Some(
                 window_create_top_level(Some(&mut delegate)).expect("failed to create the window"),
             );
+            log("top-level window created");
         }
     }
 }
@@ -279,6 +297,7 @@ impl ImplPanelDelegate for DemoWindowDelegate {}
 
 impl ImplWindowDelegate for DemoWindowDelegate {
     fn on_window_created(&self, window: Option<&mut impl ImplWindow>) {
+        log("window created");
         if let Some(window) = window {
             window.set_size(Some(&Size {
                 width: WINDOW_WIDTH,
@@ -291,6 +310,7 @@ impl ImplWindowDelegate for DemoWindowDelegate {
     }
 
     fn on_window_destroyed(&self, _window: Option<&mut impl ImplWindow>) {
+        log("window destroyed — quitting message loop");
         quit_message_loop();
     }
 
@@ -319,11 +339,15 @@ impl ImplWindowDelegate for DemoWindowDelegate {
 }
 
 fn main() {
+    std::panic::set_hook(Box::new(|info| log(&format!("PANIC: {}", info))));
+    log("rustweb starting");
+
     // Load Chromium Embedded Framework.framework from inside the .app bundle.
     #[cfg(target_os = "macos")]
     let _loader = {
         let loader = library_loader::LibraryLoader::new(&std::env::current_exe().unwrap(), false);
         assert!(loader.load(), "failed to load the Chromium Embedded Framework");
+        log("CEF framework loaded");
         loader
     };
 
@@ -340,6 +364,7 @@ fn main() {
         Some(&mut app),
         sandbox.as_mut_ptr(),
     );
+    log(&format!("execute_process returned {ret}"));
 
     if !is_browser_process {
         // Renderer / GPU / utility helper processes exit here.
@@ -348,6 +373,8 @@ fn main() {
     assert_eq!(ret, -1, "cannot execute browser process");
 
     let mut settings = Settings::default();
+    // Ad-hoc signed bundles have no sandbox profile; let CEF run unsandboxed.
+    settings.no_sandbox = 1;
     settings.root_cache_path = state.profile_dir.as_str().into();
     settings.persist_session_cookies = 1;
     settings.user_agent = USER_AGENT.into();
@@ -362,8 +389,10 @@ fn main() {
         1,
         "failed to initialize CEF"
     );
+    log("CEF initialized");
 
     run_message_loop();
+    log("message loop exited");
 
     let window = state.window.lock().expect("failed to lock the window");
     let window = window.as_ref().expect("window was never created");
