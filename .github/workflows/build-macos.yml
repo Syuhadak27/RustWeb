@@ -13,11 +13,12 @@ jobs:
   build:
     # Runner terbaru; target kompilasi tetap x86_64-apple-darwin / macOS 13 Ventura.
     runs-on: macos-latest
-    env:
-      # Bypass download-cef's 10 MB index limit by providing CEF directly.
-      CEF_PATH: ${{ runner.temp }}/cef
 
     steps:
+      - name: Set CEF path
+        # Bypass download-cef's 10 MB index limit by providing CEF directly.
+        run: echo "CEF_PATH=$RUNNER_TEMP/cef" >> "$GITHUB_ENV"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
