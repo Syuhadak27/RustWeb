@@ -28,7 +28,7 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          key: x86_64-apple-darwin
+          key: x86_64-apple-darwin-v2
 
       - name: Download CEF 132.3.2 (macOS x64)
         id: download
@@ -73,7 +73,6 @@ jobs:
       - name: Build RustWeb (x86_64-apple-darwin)
         id: build
         env:
-          CMAKE_OSX_ARCHITECTURES: x86_64
           MACOSX_DEPLOYMENT_TARGET: "13.0"
         run: |
           set -o pipefail
