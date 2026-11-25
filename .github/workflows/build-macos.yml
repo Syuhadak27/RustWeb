@@ -1,4 +1,4 @@
-name: Build & Release macOS Intel
+name: Build & Release macOS Universal
 
 on:
   push:
@@ -11,74 +11,75 @@ permissions:
 
 jobs:
   build:
-    # macOS terbaru dengan arsitektur Intel; target tetap macOS 13 Ventura x86_64.
-    runs-on: macos-26-intel
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-apple-darwin
+            runner: macos-26-intel
+            cef: cef_binary_132.3.2+g4997b2f+chromium-132.0.6834.161_macosx64
+          - arch: arm64
+            target: aarch64-apple-darwin
+            runner: macos-latest
+            cef: cef_binary_132.3.2+g4997b2f+chromium-132.0.6834.161_macosarm64
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Set CEF path
-        # Bypass download-cef's 10 MB index limit by providing CEF directly.
         run: echo "CEF_PATH=$RUNNER_TEMP/cef" >> "$GITHUB_ENV"
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install Rust target
-        run: rustup target add x86_64-apple-darwin
+        run: rustup target add ${{ matrix.target }}
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          key: x86_64-apple-darwin-v3
+          key: ${{ matrix.target }}
 
-      - name: Download CEF 132.3.2 (macOS x64)
+      - name: Download CEF (${{ matrix.arch }})
         id: download
         run: |
           set -o pipefail
           if ! {
             set -e
-            mkdir -p "$CEF_PATH"
-            NAME="cef_binary_132.3.2+g4997b2f+chromium-132.0.6834.161_macosx64"
-            URL_NAME="${NAME//+/%2B}"
+            URL_NAME="${{ matrix.cef }}"
+            URL_NAME="${URL_NAME//+/%2B}"
+            rm -rf "$RUNNER_TEMP/cef-extract" "$CEF_PATH"
+            mkdir -p "$RUNNER_TEMP/cef-extract" "$CEF_PATH"
             curl -fsSL --retry 3 --retry-delay 5 \
               -o "$RUNNER_TEMP/cef.tar.bz2" \
               "https://cef-builds.spotifycdn.com/${URL_NAME}.tar.bz2"
-            echo "curl ok, bytes: $(wc -c < "$RUNNER_TEMP/cef.tar.bz2")"
-            SRC="$RUNNER_TEMP/cef-extract/$NAME"
-            rm -rf "$RUNNER_TEMP/cef-extract" "$CEF_PATH"
-            mkdir -p "$RUNNER_TEMP/cef-extract" "$CEF_PATH"
+            SRC="$RUNNER_TEMP/cef-extract/${{ matrix.cef }}"
             tar -xjf "$RUNNER_TEMP/cef.tar.bz2" -C "$RUNNER_TEMP/cef-extract"
-            # CEF's macOS layout keeps the framework in Release/.
             cp -R "$SRC/Release/." "$CEF_PATH/"
             for item in CMakeLists.txt cmake include libcef_dll; do
               cp -R "$SRC/$item" "$CEF_PATH/"
             done
             cp -R "$SRC/CREDITS.html" "$CEF_PATH/" 2>/dev/null || true
-            # rustc looks for libcef_sandbox.a; CEF ships it as cef_sandbox.a.
-            find "$SRC" -name 'cef_sandbox.a' -print
             if [ -f "$SRC/Release/cef_sandbox.a" ]; then
               cp "$SRC/Release/cef_sandbox.a" "$CEF_PATH/libcef_sandbox.a"
             elif [ -f "$SRC/cef_sandbox.a" ]; then
               cp "$SRC/cef_sandbox.a" "$CEF_PATH/libcef_sandbox.a"
             fi
-            echo "CEF dir contents:"
-            ls -la "$CEF_PATH" | head -n 30
-            test -d "$CEF_PATH/Chromium Embedded Framework.framework" || {
-              echo "framework not found at expected path"
-              exit 1
-            }
+            test -d "$CEF_PATH/Chromium Embedded Framework.framework"
           } 2>&1 | tee cef-download.log; then
             err="$(tail -n 30 cef-download.log | tr '\n' ' ' | cut -c1-1500)"
             echo "err=$err" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
-      - name: Build RustWeb (x86_64-apple-darwin)
+      - name: Build RustWeb (${{ matrix.target }})
         id: build
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
         run: |
           set -o pipefail
-          if ! cargo build --release --target x86_64-apple-darwin 2>&1 | tee build.log; then
+          if ! cargo build --release --target ${{ matrix.target }} 2>&1 | tee build.log; then
             err="$(tail -n 60 build.log | tr '\n' ' ' | cut -c1-2000)"
             echo "err=$err" >> "$GITHUB_OUTPUT"
             exit 1
@@ -88,36 +89,82 @@ jobs:
         if: failure()
         run: |
           {
-            echo "### Failure diagnostics"
             echo '```text'
-            tail -n 250 cef-download.log 2>/dev/null || true
-            tail -n 250 build.log 2>/dev/null || true
+            tail -n 200 cef-download.log 2>/dev/null || true
+            tail -n 200 build.log 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stage artifacts
+        run: |
+          set -euo pipefail
+          STAGE="stage-${{ matrix.arch }}"
+          mkdir -p "$STAGE/bin" "$STAGE/cef"
+          cp "target/${{ matrix.target }}/release/rustweb" "$STAGE/bin/"
+          cp "target/${{ matrix.target }}/release/rustweb_helper" "$STAGE/bin/"
+          cp -R "$CEF_PATH/." "$STAGE/cef/"
+          chmod +x "$STAGE/bin/rustweb" "$STAGE/bin/rustweb_helper"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.arch }}
+          path: stage-${{ matrix.arch }}
+          if-no-files-found: error
+
+  package:
+    name: package universal app
+    needs: build
+    runs-on: macos-26-intel
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          path: artifacts
+
+      - name: Create universal binaries and framework
+        run: |
+          set -euo pipefail
+          X64="artifacts/build-x86_64"
+          ARM="artifacts/build-arm64"
+          DEST="dist/universal"
+
+          mkdir -p "$DEST"
+          lipo -create "$X64/bin/rustweb" "$ARM/bin/rustweb" -output "$DEST/rustweb"
+          lipo -create "$X64/bin/rustweb_helper" "$ARM/bin/rustweb_helper" -output "$DEST/rustweb_helper"
+
+          FW="Chromium Embedded Framework.framework"
+          rm -rf "$DEST/$FW"
+          cp -R "$ARM/cef/$FW" "$DEST/$FW"
+
+          # Merge every Mach-O file inside the framework (binary + dylibs).
+          while IFS= read -r -d '' file; do
+            rel="${file#$ARM/cef/$FW/}"
+            other="$X64/cef/$FW/$rel"
+            if [ -f "$other" ] && file -b "$file" | grep -q 'Mach-O'; then
+              lipo -create "$other" "$file" -output "$file"
+            fi
+          done < <(find "$DEST/$FW" -type f -print0)
+
+          echo "Universal framework:"
+          find "$DEST/$FW" -type f -name 'Chromium Embedded Framework' -o -name '*.dylib' | head -n 20
 
       - name: Assemble RustWeb.app
         run: |
           set -euo pipefail
-
           APP="dist/RustWeb.app"
-          TARGET="target/x86_64-apple-darwin/release"
+          UNI="dist/universal"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
 
-          cp "$TARGET/rustweb" "$APP/Contents/MacOS/rustweb"
+          cp "$UNI/rustweb" "$APP/Contents/MacOS/rustweb"
           cp Info.plist "$APP/Contents/Info.plist"
+          cp -R "$UNI/Chromium Embedded Framework.framework" "$APP/Contents/Frameworks/"
 
-          # Use the CEF distribution prepared before the build.
-          CEF_DIR="$CEF_PATH"
-          if [ ! -d "$CEF_DIR/Chromium Embedded Framework.framework" ]; then
-            CEF_DIR="$(find target/x86_64-apple-darwin/release/build -type d -name cef_macos_x86_64 -print -quit)"
-          fi
-          if [ -z "$CEF_DIR" ]; then
-            echo "Could not locate the downloaded CEF directory" >&2
-            exit 1
-          fi
-          cp -R "$CEF_DIR/Chromium Embedded Framework.framework" "$APP/Contents/Frameworks/"
-
-          # CEF expects five helper apps next to the framework.
           helpers=(
             "rustweb Helper (GPU)|gpu"
             "rustweb Helper (Renderer)|renderer"
@@ -130,7 +177,7 @@ jobs:
             suffix="${entry##*|}"
             helper="$APP/Contents/Frameworks/$name.app"
             mkdir -p "$helper/Contents/MacOS"
-            cp "$TARGET/rustweb_helper" "$helper/Contents/MacOS/$name"
+            cp "$UNI/rustweb_helper" "$helper/Contents/MacOS/$name"
             chmod +x "$helper/Contents/MacOS/$name"
             cat > "$helper/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -150,9 +197,9 @@ jobs:
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleVersion</key>
-              <string>0.1.0</string>
+              <string>0.2.0</string>
               <key>CFBundleShortVersionString</key>
-              <string>0.1.0</string>
+              <string>0.2.0</string>
               <key>LSMinimumSystemVersion</key>
               <string>13.0</string>
               <key>LSUIElement</key>
@@ -186,20 +233,20 @@ jobs:
           hdiutil create -volname RustWeb \
             -srcfolder dist/RustWeb.app \
             -ov -format UDZO \
-            dist/RustWeb-macOS-Intel.dmg
+            dist/RustWeb-macOS-Universal.dmg
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RustWeb-macOS-Intel
-          path: dist/RustWeb-macOS-Intel.dmg
+          name: RustWeb-macOS-Universal
+          path: dist/RustWeb-macOS-Universal.dmg
           if-no-files-found: error
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          name: RustWeb ${{ github.ref_name }} (macOS Intel)
-          files: dist/RustWeb-macOS-Intel.dmg
+          name: RustWeb ${{ github.ref_name }} (macOS Universal)
+          files: dist/RustWeb-macOS-Universal.dmg
           generate_release_notes: true
           fail_on_unmatched_files: true
