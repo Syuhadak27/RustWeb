@@ -170,10 +170,10 @@ fn tray_target_class() -> &'static AnyClass {
 /// Resolve the native NSWindow backing a CEF Views window handle.
 fn ns_window_from_cef(window: &impl ImplWindow) -> Option<&NSWindow> {
     let handle = window.get_window_handle();
-    if handle == 0 {
+    if handle.is_null() {
         return None;
     }
-    Some(unsafe { &*(handle as usize as *const NSWindow) })
+    Some(unsafe { &*(handle as *const NSWindow) })
 }
 
 /// Make the native window capable of macOS Full Screen (green traffic light).
@@ -211,7 +211,7 @@ fn install_app_menu() {
     let main_menu = NSMenu::new(mtm);
     let view_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(),
+            NSMenuItem::alloc(mtm),
             &NSString::from_str("View"),
             None,
             &NSString::from_str(""),
