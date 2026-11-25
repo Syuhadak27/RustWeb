@@ -1,0 +1,25 @@
+[package]
+name = "rustweb"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+
+[[bin]]
+name = "rustweb"
+path = "src/main.rs"
+
+[[bin]]
+name = "rustweb_helper"
+path = "src/helper.rs"
+
+[dependencies]
+# CEF 132 is the closest published release to the requested CEF 131.
+# The CEF binaries are downloaded automatically by cef-dll-sys at build time.
+cef = "132.3.2"
+dirs = "5.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
