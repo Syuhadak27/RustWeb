@@ -37,11 +37,13 @@ jobs:
           if ! {
             set -e
             mkdir -p "$CEF_PATH"
+            NAME="cef_binary_132.3.2+g4997b2f+chromium-132.0.6834.161_macosx64"
+            URL_NAME="${NAME//+/%2B}"
             curl -fsSL --retry 3 --retry-delay 5 \
               -o "$RUNNER_TEMP/cef.tar.bz2" \
-              "https://cef-builds.spotifycdn.com/cef_binary_132.3.2+g4997b2f+chromium-132.0.6834.161_macosx64.tar.bz2"
+              "https://cef-builds.spotifycdn.com/${URL_NAME}.tar.bz2"
             echo "curl ok, bytes: $(wc -c < "$RUNNER_TEMP/cef.tar.bz2")"
-            SRC="$RUNNER_TEMP/cef-extract/cef_binary_132.3.2+g4997b2f+chromium-132.0.6834.161_macosx64"
+            SRC="$RUNNER_TEMP/cef-extract/$NAME"
             rm -rf "$RUNNER_TEMP/cef-extract" "$CEF_PATH"
             mkdir -p "$RUNNER_TEMP/cef-extract" "$CEF_PATH"
             tar -xjf "$RUNNER_TEMP/cef.tar.bz2" -C "$RUNNER_TEMP/cef-extract"
@@ -129,6 +131,7 @@ jobs:
             helper="$APP/Contents/Frameworks/$name.app"
             mkdir -p "$helper/Contents/MacOS"
             cp "$TARGET/rustweb_helper" "$helper/Contents/MacOS/$name"
+            chmod +x "$helper/Contents/MacOS/$name"
             cat > "$helper/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -167,7 +170,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p icon.iconset dist/RustWeb.app/Contents/Resources
-          for size in 16 32 64 128 256 512; do
+          for size in 16 32 128 256 512; do
             double=$((size * 2))
             sips -z "$size" "$size" icon.png --out "icon.iconset/icon_${size}x${size}.png" >/dev/null
             sips -z "$double" "$double" icon.png --out "icon.iconset/icon_${size}x${size}@2x.png" >/dev/null
