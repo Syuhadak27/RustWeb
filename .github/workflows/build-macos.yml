@@ -27,14 +27,19 @@ jobs:
           key: x86_64-apple-darwin
 
       - name: Build RustWeb (x86_64-apple-darwin)
+        id: build
         env:
           CMAKE_OSX_ARCHITECTURES: x86_64
           MACOSX_DEPLOYMENT_TARGET: "13.0"
         run: |
           set -o pipefail
-          cargo build --release --target x86_64-apple-darwin 2>&1 | tee build.log
+          if ! cargo build --release --target x86_64-apple-darwin 2>&1 | tee build.log; then
+            err="$(grep -E '^error|^warning|^thread|Caused by|failed to|error\[' build.log | head -n 12 | tr '\n' ' ' | cut -c1-900)"
+            echo "err=$err" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
 
-      - name: Publish build diagnostics on failure
+      - name: "BUILD ERROR: ${{ steps.build.outputs.err }}"
         if: failure()
         run: |
           {
