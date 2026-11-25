@@ -3,8 +3,8 @@
 
 use cef::{args::Args, rc::*, sandbox_info::SandboxInfo, *};
 use std::ffi::c_int;
-use objc2::runtime::NSObject;
-use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker};
+use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, NSObject, Sel};
+use objc2::{msg_send, sel, AnyThread, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSButton, NSControl, NSImage, NSStatusItem, NSStatusBar};
 use objc2_foundation::{NSString, NSObjectProtocol, NSUserNotification, NSUserNotificationCenter};
 use std::process::Command;
@@ -126,26 +126,22 @@ fn app_state() -> Option<&'static AppState> {
 // Native macOS menu bar icon + Notification Center helpers
 // ---------------------------------------------------------------------------
 
-define_class!(
-    #[unsafe(super(NSObject))]
-    #[name = "RustWebTrayTarget"]
-    struct TrayTarget;
-);
-
-unsafe impl NSObjectProtocol for TrayTarget {}
-
-impl TrayTarget {
-    #[method(toggleWindow)]
-    fn toggle_window(&self) {
-        if let Some(state) = app_state() {
-            state.show_window();
-        }
+extern "C-unwind" fn toggle_window(_this: &NSObject, _cmd: Sel) {
+    if let Some(state) = app_state() {
+        state.show_window();
     }
+}
 
-    fn new() -> objc2::rc::Retained<Self> {
-        let this = Self::alloc().set_ivars(());
-        unsafe { msg_send![super(this), init] }
+fn tray_target_class() -> &'static AnyClass {
+    let mut builder = ClassBuilder::new(c"RustWebTrayTarget", NSObject::class())
+        .expect("failed to create the menu bar target class");
+    unsafe {
+        builder.add_method(
+            sel!(toggleWindow),
+            toggle_window as extern "C-unwind" fn(_, _),
+        );
     }
+    builder.register()
 }
 
 static mut STATUS_ITEM: Option<objc2::rc::Retained<NSStatusItem>> = None;
@@ -189,7 +185,7 @@ fn set_tray_unread(unread: bool) {
 fn install_tray() {
     let Some(mtm) = MainThreadMarker::new() else { return };
     let item = NSStatusBar::systemStatusBar().statusItemWithLength(24.0);
-    let target = TrayTarget::new();
+    let target: objc2::rc::Retained<AnyObject> = unsafe { msg_send![tray_target_class(), new] };
     if let Some(button) = item.button(mtm) {
         if let Some(image) = tray_image("tray-template.png") {
             button.setImage(Some(&image));
@@ -628,7 +624,7 @@ impl ImplV8handler for NotifyV8Handler {
             .unwrap_or_default();
 
         if let Some(frame) = &self.frame {
-            if let Some(message) = process_message_create(Some(&NOTIFICATION_MESSAGE.into())) {
+            if let Some(mut message) = process_message_create(Some(&NOTIFICATION_MESSAGE.into())) {
                 if let Some(args) = message.get_argument_list() {
                     args.set_string(0, Some(&title.as_str().into()));
                     args.set_string(1, Some(&body.as_str().into()));
