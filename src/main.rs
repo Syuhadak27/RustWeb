@@ -2,6 +2,7 @@
 //! Pure Rust + Chromium Embedded Framework. No Tauri, no WKWebView, no updater.
 
 use cef::{args::Args, rc::*, sandbox_info::SandboxInfo, *};
+use std::ffi::c_int;
 use objc2::runtime::NSObject;
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSButton, NSControl, NSImage, NSStatusItem, NSStatusBar};
@@ -134,7 +135,7 @@ define_class!(
 unsafe impl NSObjectProtocol for TrayTarget {}
 
 impl TrayTarget {
-    #[unsafe(method(toggleWindow))]
+    #[method(toggleWindow)]
     fn toggle_window(&self) {
         if let Some(state) = app_state() {
             state.show_window();
@@ -161,9 +162,7 @@ fn resource_path(name: &str) -> Option<String> {
 
 fn tray_image(name: &str) -> Option<objc2::rc::Retained<NSImage>> {
     let path = resource_path(name)?;
-    let image = unsafe {
-        NSImage::initWithContentsOfFile(NSImage::alloc(), &NSString::from_str(&path))
-    };
+    let image = NSImage::initWithContentsOfFile(NSImage::alloc(), &NSString::from_str(&path));
     let image = image?;
     image.setTemplate(true);
     Some(image)
@@ -195,8 +194,8 @@ fn install_tray() {
         if let Some(image) = tray_image("tray-template.png") {
             button.setImage(Some(&image));
         }
-        button.setTarget(Some(&target));
         unsafe {
+            button.setTarget(Some(&target));
             button.setAction(Some(sel!(toggleWindow)));
         }
     }
