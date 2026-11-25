@@ -1,9 +1,13 @@
-name: Build macOS Intel
+name: Build & Release macOS Intel
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -122,3 +126,12 @@ jobs:
           name: RustWeb-macOS-Intel
           path: dist/RustWeb-macOS-Intel.dmg
           if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: RustWeb ${{ github.ref_name }} (macOS Intel)
+          files: dist/RustWeb-macOS-Intel.dmg
+          generate_release_notes: true
+          fail_on_unmatched_files: true
