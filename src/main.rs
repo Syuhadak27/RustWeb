@@ -7,12 +7,13 @@ use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, NSObject, Sel};
 use objc2::{msg_send, sel, AnyThread, ClassType, MainThreadMarker};
 use objc2_app_kit::{
     NSEventModifierFlags, NSApplication, NSImage, NSMenu, NSMenuItem, NSStatusItem, NSStatusBar, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWindowCollectionBehavior, NSWindowStyleMask, NSTerminate,
 };
 use objc2_foundation::{NSString, NSObjectProtocol, NSUserNotification, NSUserNotificationCenter};
 use std::process::Command;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 const WHATSAPP_URL: &str = "https://web.whatsapp.com";
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -75,7 +76,7 @@ fn log(message: &str) {
             .open(dir.join("launch.log"))
         {
             use std::io::Write;
-            let _ = writeln!(file, "{}", message);
+            let _ = writeln!(file, "[{}] {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), message);
         }
     }
 }
@@ -94,16 +95,18 @@ fn open_external(url: &str) {
 
 /// Shared window handle. Stored as a raw pointer so AppKit callbacks can
 /// restore the window from the menu bar.
-static APP_STATE: AtomicPtr<AppState> = AtomicPtr::new(std::ptr::null_mut());
+static APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
 
 struct AppState {
     window: Mutex<Option<Window>>,
+    tray_unread: Mutex<bool>,
 }
 
 impl AppState {
     fn new() -> Self {
         Self {
             window: Mutex::new(None),
+            tray_unread: Mutex::new(false),
         }
     }
 
@@ -114,16 +117,42 @@ impl AppState {
             }
         }
     }
-}
 
-fn app_state() -> Option<&'static AppState> {
-    let ptr = APP_STATE.load(Ordering::SeqCst);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { &*ptr })
+    fn set_window(&self, window: Option<Window>) {
+        if let Ok(mut guard) = self.window.lock() {
+            *guard = window;
+        }
+    }
+
+    fn set_tray_unread(&self, unread: bool) {
+        if let Ok(mut guard) = self.tray_unread.lock() {
+            *guard = unread;
+        }
+        // Update tray icon on main thread
+        let _ = MainThreadMarker::new().map(|mtm| {
+            unsafe {
+                if let Some(item) = STATUS_ITEM.get() {
+                    if let Some(button) = item.button(mtm) {
+                        let name = if unread {
+                            "tray-template-unread.png"
+                        } else {
+                            "tray-template.png"
+                        };
+                        if let Some(image) = tray_image(name) {
+                            button.setImage(Some(&image));
+                        }
+                    }
+                }
+            }
+        });
     }
 }
+
+fn app_state() -> Option<&'static Arc<AppState>> {
+    APP_STATE.get()
+}
+
+static STATUS_ITEM: OnceLock<objc2::rc::Retained<NSStatusItem>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Native macOS menu bar icon + Notification Center helpers
@@ -132,6 +161,12 @@ fn app_state() -> Option<&'static AppState> {
 extern "C-unwind" fn toggle_window(_this: &NSObject, _cmd: Sel) {
     if let Some(state) = app_state() {
         state.show_window();
+    }
+}
+
+extern "C-unwind" fn quit_app(_this: &NSObject, _cmd: Sel) {
+    if let Some(mtm) = MainThreadMarker::new() {
+        NSApplication::sharedApplication(mtm).terminate(None);
     }
 }
 
@@ -152,19 +187,26 @@ extern "C-unwind" fn toggle_full_screen(
 }
 
 fn tray_target_class() -> &'static AnyClass {
-    let mut builder = ClassBuilder::new(c"RustWebTrayTarget", NSObject::class())
-        .expect("failed to create the menu bar target class");
-    unsafe {
-        builder.add_method(
-            sel!(toggleWindow),
-            toggle_window as extern "C-unwind" fn(_, _),
-        );
-        builder.add_method(
-            sel!(toggleFullScreen:),
-            toggle_full_screen as extern "C-unwind" fn(_, _, _),
-        );
-    }
-    builder.register()
+    static CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
+    *CLASS.get_or_init(|| {
+        let mut builder = ClassBuilder::new(c"RustWebTrayTarget", NSObject::class())
+            .expect("failed to create the menu bar target class");
+        unsafe {
+            builder.add_method(
+                sel!(toggleWindow),
+                toggle_window as extern "C-unwind" fn(_, _),
+            );
+            builder.add_method(
+                sel!(quitApp:),
+                quit_app as extern "C-unwind" fn(_, _, _),
+            );
+            builder.add_method(
+                sel!(toggleFullScreen:),
+                toggle_full_screen as extern "C-unwind" fn(_, _, _),
+            );
+        }
+        builder.register()
+    })
 }
 
 /// Resolve the native NSWindow backing a CEF Views window handle.
@@ -173,6 +215,7 @@ fn ns_window_from_cef(window: &impl ImplWindow) -> Option<&NSWindow> {
     if handle.is_null() {
         return None;
     }
+    // Safety: CEF on macOS returns NSWindow* as window handle
     Some(unsafe { &*(handle as *const NSWindow) })
 }
 
@@ -205,10 +248,26 @@ fn ensure_native_fullscreen(fullscreen: bool) {
     }
 }
 
-/// Application menu: View → Enter Full Screen (⌃⌘F).
+/// Application menu: View → Enter Full Screen (⌃⌘F), and Quit.
 fn install_app_menu() {
     let Some(mtm) = MainThreadMarker::new() else { return };
     let main_menu = NSMenu::new(mtm);
+    
+    // App menu (RustWeb)
+    let app_item = NSMenuItem::new(mtm);
+    let app_menu = NSMenu::new(mtm);
+    let quit_item = unsafe {
+        app_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Quit RustWeb"),
+            Some(sel!(quitApp:)),
+            &NSString::from_str("q"),
+        )
+    };
+    quit_item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+    app_item.setSubmenu(Some(&app_menu));
+    main_menu.addItem(&app_item);
+
+    // View menu
     let view_item = NSMenuItem::new(mtm);
     view_item.setTitle(&NSString::from_str("View"));
     let view_menu = NSMenu::new(mtm);
@@ -224,10 +283,9 @@ fn install_app_menu() {
     );
     view_item.setSubmenu(Some(&view_menu));
     main_menu.addItem(&view_item);
+
     NSApplication::sharedApplication(mtm).setMainMenu(Some(&main_menu));
 }
-
-static mut STATUS_ITEM: Option<objc2::rc::Retained<NSStatusItem>> = None;
 
 fn resource_path(name: &str) -> Option<String> {
     let exe = std::env::current_exe().ok()?;
@@ -247,24 +305,6 @@ fn tray_image(name: &str) -> Option<objc2::rc::Retained<NSImage>> {
     Some(image)
 }
 
-fn set_tray_unread(unread: bool) {
-    let name = if unread {
-        "tray-template-unread.png"
-    } else {
-        "tray-template.png"
-    };
-    let Some(image) = tray_image(name) else { return };
-    let Some(mtm) = MainThreadMarker::new() else { return };
-    #[allow(static_mut_refs)]
-    unsafe {
-        if let Some(item) = STATUS_ITEM.as_ref() {
-            if let Some(button) = item.button(mtm) {
-                button.setImage(Some(&image));
-            }
-        }
-    }
-}
-
 fn install_tray() {
     let Some(mtm) = MainThreadMarker::new() else { return };
     let item = NSStatusBar::systemStatusBar().statusItemWithLength(24.0);
@@ -278,17 +318,41 @@ fn install_tray() {
             button.setAction(Some(sel!(toggleWindow)));
         }
     }
-    #[allow(static_mut_refs)]
+    // Create menu for right-click
+    let menu = NSMenu::new(mtm);
+    let show_item = NSMenuItem::new(mtm);
+    show_item.setTitle(&NSString::from_str("Show RustWeb"));
     unsafe {
-        STATUS_ITEM = Some(item);
+        show_item.setTarget(Some(&target));
+        show_item.setAction(Some(sel!(toggleWindow)));
+    }
+    menu.addItem(&show_item);
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let quit_item = NSMenuItem::new(mtm);
+    quit_item.setTitle(&NSString::from_str("Quit RustWeb"));
+    unsafe {
+        quit_item.setTarget(Some(&target));
+        quit_item.setAction(Some(sel!(quitApp:)));
+    }
+    menu.addItem(&quit_item);
+    item.setMenu(Some(&menu));
+    
+    let _ = STATUS_ITEM.set(item);
+}
+
+fn set_tray_unread(unread: bool) {
+    if let Some(state) = app_state() {
+        state.set_tray_unread(unread);
     }
 }
 
-#[allow(deprecated)]
+/// Modern notification using NSUserNotification (compatible with macOS 13+)
+/// For macOS 14+, could use UNUserNotificationCenter but requires more setup
 fn native_notify(title: &str, body: &str) {
     let notification = NSUserNotification::new();
     notification.setTitle(Some(&NSString::from_str(title)));
     notification.setInformativeText(Some(&NSString::from_str(body)));
+    notification.setSoundName(None); // No sound for WhatsApp notifications
     NSUserNotificationCenter::defaultUserNotificationCenter().deliverNotification(&notification);
     set_tray_unread(true);
 }
@@ -353,6 +417,14 @@ impl ImplApp for DemoApp {
             command_line.append_switch(Some(&"disable-background-timer-throttling".into()));
             command_line.append_switch(Some(&"disable-backgrounding-occluded-windows".into()));
             command_line.append_switch(Some(&"disable-renderer-backgrounding".into()));
+            // Performance optimizations
+            command_line.append_switch(Some(&"disable-gpu-vsync".into()));
+            command_line.append_switch(Some(&"enable-gpu-rasterization".into()));
+            command_line.append_switch(Some(&"enable-zero-copy".into()));
+            // Reduce memory usage
+            command_line.append_switch_with_value(Some(&"max-active-renderer-processes".into()), Some(&"4".into()));
+            command_line.append_switch(Some(&"disable-site-isolation-trials".into()));
+            command_line.append_switch(Some(&"disable-features".into()), Some(&"CalculateNativeWinOcclusion,InterestFeedContentSuggestions".into()));
         }
     }
 
@@ -436,15 +508,13 @@ impl ImplBrowserProcessHandler for DemoBrowserProcessHandler {
         .expect("failed to create the browser view");
 
         let mut delegate = DemoWindowDelegate::new(browser_view);
-        if let Ok(mut window) = app_state()
-            .expect("application state missing")
-            .window
-            .lock()
-        {
-            *window = Some(
-                window_create_top_level(Some(&mut delegate)).expect("failed to create the window"),
-            );
-            log("top-level window created");
+        if let Some(state) = app_state() {
+            if let Ok(mut window) = state.window.lock() {
+                *window = Some(
+                    window_create_top_level(Some(&mut delegate)).expect("failed to create the window"),
+                );
+                log("top-level window created");
+            }
         }
     }
 }
@@ -994,6 +1064,9 @@ impl ImplWindowDelegate for DemoWindowDelegate {
 
     fn on_window_destroyed(&self, _window: Option<&mut impl ImplWindow>) {
         log("window destroyed — quitting message loop");
+        if let Some(state) = app_state() {
+            state.set_window(None);
+        }
         quit_message_loop();
     }
 
@@ -1029,6 +1102,12 @@ fn main() {
     std::panic::set_hook(Box::new(|info| log(&format!("PANIC: {}", info))));
     log("rustweb starting");
 
+    // Initialize app state early
+    let state = Arc::new(AppState::new());
+    APP_STATE.set(state.clone()).expect("APP_STATE already initialized");
+    install_tray();
+    install_app_menu();
+
     // Load Chromium Embedded Framework.framework from inside the .app bundle.
     #[cfg(target_os = "macos")]
     let _loader = {
@@ -1037,11 +1116,6 @@ fn main() {
         log("CEF framework loaded");
         loader
     };
-
-    let state = Arc::new(AppState::new());
-    APP_STATE.store(Arc::into_raw(state.clone()) as *mut AppState, Ordering::SeqCst);
-    install_tray();
-    install_app_menu();
 
     let args = Args::new();
     let cmd = args.as_cmd_line().unwrap();
@@ -1066,6 +1140,14 @@ fn main() {
     settings.root_cache_path = cache_dir().as_str().into();
     settings.persist_session_cookies = 1;
     settings.user_agent = USER_AGENT.into();
+    // Performance & memory optimizations
+    settings.multi_threaded_message_loop = 1;
+    settings.windowless_rendering_enabled = 0;
+    settings.command_line_args_disabled = 0;
+    settings.cache_path = cache_dir().as_str().into();
+    settings.persist_user_preferences = 1;
+    settings.uncaught_exception_stack_size = 10; // Limit stack traces
+    settings.background_color = 0xFFFFFFFF; // White background
 
     assert_eq!(
         initialize(
@@ -1081,5 +1163,10 @@ fn main() {
 
     run_message_loop();
     log("message loop exited");
+    
+    // Cleanup
     shutdown();
+    log("CEF shutdown complete");
+    
+    // AppState will be dropped when Arc goes out of scope (end of main)
 }

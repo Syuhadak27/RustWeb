@@ -17,6 +17,7 @@ path = "src/helper.rs"
 # CEF binaries are downloaded by the macOS CI workflow and provided via CEF_PATH.
 cef = "132.3.2"
 dirs = "5.0"
+chrono = { version = "0.4", features = ["serde"] }  # For timestamped logging
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Native menu bar icon and Notification Center bridge (no Tauri / no WKWebView).
