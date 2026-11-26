@@ -7,13 +7,11 @@ use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, NSObject, Sel};
 use objc2::{msg_send, sel, AnyThread, ClassType, MainThreadMarker};
 use objc2_app_kit::{
     NSEventModifierFlags, NSApplication, NSImage, NSMenu, NSMenuItem, NSStatusItem, NSStatusBar, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask, NSTerminate,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_foundation::{NSString, NSObjectProtocol, NSUserNotification, NSUserNotificationCenter};
+use objc2_foundation::{NSString, NSUserNotification, NSUserNotificationCenter};
 use std::process::Command;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 
 const WHATSAPP_URL: &str = "https://web.whatsapp.com";
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -93,13 +91,15 @@ fn open_external(url: &str) {
     let _ = Command::new("open").arg(url).spawn();
 }
 
-/// Shared window handle. Stored as a raw pointer so AppKit callbacks can
-/// restore the window from the menu bar.
+/// Shared app state including tray item (must stay on main thread).
 static APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
 
+#[derive(Debug)]
 struct AppState {
     window: Mutex<Option<Window>>,
     tray_unread: Mutex<bool>,
+    // Store tray item here since Retained<NSStatusItem> is not Sync/Send
+    tray_item: Mutex<Option<objc2::rc::Retained<NSStatusItem>>>,
 }
 
 impl AppState {
@@ -107,6 +107,7 @@ impl AppState {
         Self {
             window: Mutex::new(None),
             tray_unread: Mutex::new(false),
+            tray_item: Mutex::new(None),
         }
     }
 
@@ -124,14 +125,20 @@ impl AppState {
         }
     }
 
+    fn set_tray_item(&self, item: objc2::rc::Retained<NSStatusItem>) {
+        if let Ok(mut guard) = self.tray_item.lock() {
+            *guard = Some(item);
+        }
+    }
+
     fn set_tray_unread(&self, unread: bool) {
         if let Ok(mut guard) = self.tray_unread.lock() {
             *guard = unread;
         }
         // Update tray icon on main thread
-        let _ = MainThreadMarker::new().map(|mtm| {
-            unsafe {
-                if let Some(item) = STATUS_ITEM.get() {
+        if let Some(mtm) = MainThreadMarker::new() {
+            if let Ok(guard) = self.tray_item.lock() {
+                if let Some(item) = guard.as_ref() {
                     if let Some(button) = item.button(mtm) {
                         let name = if unread {
                             "tray-template-unread.png"
@@ -144,15 +151,13 @@ impl AppState {
                     }
                 }
             }
-        });
+        }
     }
 }
 
 fn app_state() -> Option<&'static Arc<AppState>> {
     APP_STATE.get()
 }
-
-static STATUS_ITEM: OnceLock<objc2::rc::Retained<NSStatusItem>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Native macOS menu bar icon + Notification Center helpers
@@ -164,7 +169,7 @@ extern "C-unwind" fn toggle_window(_this: &NSObject, _cmd: Sel) {
     }
 }
 
-extern "C-unwind" fn quit_app(_this: &NSObject, _cmd: Sel) {
+extern "C-unwind" fn quit_app(_this: &NSObject, _cmd: Sel, _sender: Option<&AnyObject>) {
     if let Some(mtm) = MainThreadMarker::new() {
         NSApplication::sharedApplication(mtm).terminate(None);
     }
@@ -337,7 +342,9 @@ fn install_tray() {
     menu.addItem(&quit_item);
     item.setMenu(Some(&menu));
     
-    let _ = STATUS_ITEM.set(item);
+    if let Some(state) = app_state() {
+        state.set_tray_item(item);
+    }
 }
 
 fn set_tray_unread(unread: bool) {
@@ -346,8 +353,9 @@ fn set_tray_unread(unread: bool) {
     }
 }
 
-/// Modern notification using NSUserNotification (compatible with macOS 13+)
+/// Notification using NSUserNotification (compatible with macOS 13+)
 /// For macOS 14+, could use UNUserNotificationCenter but requires more setup
+#[allow(deprecated)]
 fn native_notify(title: &str, body: &str) {
     let notification = NSUserNotification::new();
     notification.setTitle(Some(&NSString::from_str(title)));
@@ -424,6 +432,7 @@ impl ImplApp for DemoApp {
             // Reduce memory usage
             command_line.append_switch_with_value(Some(&"max-active-renderer-processes".into()), Some(&"4".into()));
             command_line.append_switch(Some(&"disable-site-isolation-trials".into()));
+            // Combine disable-features into single string
             command_line.append_switch(Some(&"disable-features".into()), Some(&"CalculateNativeWinOcclusion,InterestFeedContentSuggestions".into()));
         }
     }
@@ -1145,7 +1154,6 @@ fn main() {
     settings.windowless_rendering_enabled = 0;
     settings.command_line_args_disabled = 0;
     settings.cache_path = cache_dir().as_str().into();
-    settings.persist_user_preferences = 1;
     settings.uncaught_exception_stack_size = 10; // Limit stack traces
     settings.background_color = 0xFFFFFFFF; // White background
 
