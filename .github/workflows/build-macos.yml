@@ -167,8 +167,28 @@ jobs:
           iconutil -c icns icon.iconset -o dist/RustWeb.app/Contents/Resources/icon.icns
           rm -rf icon.iconset
 
-      - name: Ad-hoc sign the app bundle
-        run: codesign --force --deep --sign - --entitlements entitlements.plist dist/RustWeb.app
+      - name: Ad-hoc sign the app bundle (hardened runtime, timestamped)
+        run: |
+          set -euo pipefail
+          APP="dist/RustWeb.app"
+          
+          # Sign helper apps first (inner to outer)
+          for helper in "$APP/Contents/Frameworks"/*.app; do
+            codesign --force --sign - --entitlements entitlements.plist \
+              --options runtime --timestamp "$helper"
+          done
+          
+          # Sign the main framework
+          codesign --force --sign - --entitlements entitlements.plist \
+            --options runtime --timestamp "$APP/Contents/Frameworks/Chromium Embedded Framework.framework"
+          
+          # Sign the main app bundle
+          codesign --force --deep --sign - --entitlements entitlements.plist \
+            --options runtime --timestamp "$APP"
+          
+          # Verify signatures
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          spctl --assess --type execute --verbose "$APP" || true
 
       - name: Create disk image
         run: |
